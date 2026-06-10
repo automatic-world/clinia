@@ -2,168 +2,160 @@
   <img src="./assets/app-icon.png" alt="clinia" width="160" />
 </p>
 
-<h1 align="center">clinia</h1>
-
-<p align="center">Clinical + AI — 임상 진단 지원을 위한 Opensource Library</p>
-
-GPU 기반 LLM 파인튜닝·서빙 파이프라인. 본 문서는 프로젝트의 **LLM 모델 구성**을
-베이스 모델 · 학습 · 데이터 · 추론/서빙 관점에서 정리한다.
+A GPU-based LLM fine-tuning and serving pipeline. This document describes the project's **LLM model composition** from the perspectives of base model, training, data, and inference/serving.
 
 ---
 
-## 1. 모델 구성 개요 (Model Composition)
+## 1. Model Composition Overview
 
-| 구분 | 내용 |
+| Category | Details |
 |------|------|
-| 베이스 모델 | **Llama 3.1 8B Instruct** |
-| 확장 파이프라인 | **Qwen3-32B** 멀티페이즈 (SFT → DPO → GRPO → Export) |
-| 파인튜닝 방식 | LoRA (PEFT) |
-| 배포 모델 | LoRA 어댑터 / base+LoRA 병합 모델 |
-| 배포 채널 | HuggingFace Hub — `the-platforms/MediCPX` |
-| 도메인 | CPX 의료(임상 진단) instruction-following |
+| Base model | **Llama 3.1 8B Instruct** |
+| Extended pipeline | **Qwen3-32B** multi-phase (SFT → DPO → GRPO → Export) |
+| Fine-tuning method | LoRA (PEFT) |
+| Deployed models | LoRA adapter / base+LoRA merged model |
+| Distribution channel | HuggingFace Hub — `the-platforms/MediCPX` |
+| Domain | CPX medical (clinical diagnosis) instruction-following |
 
-**두 갈래 파이프라인**
+**Two pipeline tracks**
 
-- **Llama 단일 파이프라인** — `FineTuningPipeline` : 전처리 → 토크나이즈 → LoRA 학습 → 저장
-- **Qwen3 멀티페이즈 파이프라인** — `MultiPhaseFineTuningPipeline` : SFT → DPO → GRPO → Export
+- **Llama single pipeline** — `FineTuningPipeline`: preprocessing → tokenization → LoRA training → save
+- **Qwen3 multi-phase pipeline** — `MultiPhaseFineTuningPipeline`: SFT → DPO → GRPO → Export
 
 ---
 
-## 2. 베이스 모델 & 가중치 (Base Model & Weights)
+## 2. Base Model & Weights
 
-학습 종료 시 실행별 타임스탬프 디렉터리 아래에 산출된다.
+At the end of training, artifacts are produced under a per-run timestamped directory.
 
 ```
 {output_dir}/{yyyymmddhhmm}/final_model/
-├── adapter/          # LoRA 어댑터 (수십 MB) — 베이스 공유 서빙용
+├── adapter/          # LoRA adapter (tens of MB) — for shared-base serving
 │   ├── adapter_config.json
 │   └── adapter_model.safetensors
-├── merged/           # base + LoRA 병합 모델 (수십 GB) — 단독 배포용
+├── merged/           # base + LoRA merged model (tens of GB) — for standalone deployment
 │   ├── config.json
 │   └── model.safetensors
-└── model_info.json   # 베이스 모델·학습 설정·경로 메타데이터
+└── model_info.json   # base model, training config, and path metadata
 ```
 
-| 형식 | 크기 | 로딩 | 용도 |
+| Format | Size | Loading | Use |
 |------|------|------|------|
-| `adapter/` | 작음 | `PeftModel.from_pretrained(base, adapter)` | 실험·버전관리 |
-| `merged/` | 큼 | `AutoModelForCausalLM.from_pretrained(merged)` | 의존성 없는 단독 서빙 |
+| `adapter/` | Small | `PeftModel.from_pretrained(base, adapter)` | Experiments & versioning |
+| `merged/` | Large | `AutoModelForCausalLM.from_pretrained(merged)` | Dependency-free standalone serving |
 
-**HuggingFace Hub 업로드** — `runs/upload_to_hf.py`
+**HuggingFace Hub upload** — `runs/upload_to_hf.py`
 
 ```bash
 export HF_TOKEN=hf_xxx
 python runs/upload_to_hf.py --folder-path /ai_models/merged --repo-id the-platforms/MediCPX
 ```
 
-- 학습 전용 상태(`optimizer.pt`, `scheduler.pt`, `rng_state*`)는 기본 제외
-- 상세: [`llama/huggingface_upload.md`](./llama/huggingface_upload.md)
+- Training-only state (`optimizer.pt`, `scheduler.pt`, `rng_state*`) is excluded by default
+- Details: [`llama/huggingface_upload.md`](./llama/huggingface_upload.md)
 
 ---
 
-## 3. 학습 구성 (Training Configuration)
+## 3. Training Configuration
 
-**4단계 흐름**: 전처리 → 토크나이즈 → LoRA 학습 → 저장
+**4-step flow**: preprocessing → tokenization → LoRA training → save
 
-**주요 하이퍼파라미터**
+**Key hyperparameters**
 
-| 항목 | 값 |
+| Item | Value |
 |------|-----|
 | LoRA rank | `r = 8` (α = r × 2) |
-| learning rate | `2e-4` |
+| Learning rate | `2e-4` |
 | max_length | `2048` |
-| precision | bf16 (auto) |
-| 기타 | 응답영역 손실 마스킹 + sequence packing |
+| Precision | bf16 (auto) |
+| Other | Response-region loss masking + sequence packing |
 
-**핵심 코드 경로**
+**Key code paths**
 
-| 구분 | 경로 |
+| Category | Path |
 |------|------|
-| 파이프라인 패키지 | `app/finetuning/` |
-| Llama 단일 파이프라인 | `app/finetuning/pipeline.py` (`FineTuningPipeline`) |
-| Qwen3 멀티페이즈 | `app/finetuning/pipeline.py` (`MultiPhaseFineTuningPipeline`) |
-| LoRA 학습기 | `app/finetuning/training/llama_trainer.py` |
-| GRPO 학습기 (TRL) | `app/finetuning/training/grpo_trainer.py` |
-| 보상함수 | `app/finetuning/training/rewards/` (`AgentReward`, `SIDomainReward`) |
-| LLaMA-Factory 연동 | `app/finetuning/llamafactory/` |
+| Pipeline package | `app/finetuning/` |
+| Llama single pipeline | `app/finetuning/pipeline.py` (`FineTuningPipeline`) |
+| Qwen3 multi-phase | `app/finetuning/pipeline.py` (`MultiPhaseFineTuningPipeline`) |
+| LoRA trainer | `app/finetuning/training/llama_trainer.py` |
+| GRPO trainer (TRL) | `app/finetuning/training/grpo_trainer.py` |
+| Reward functions | `app/finetuning/training/rewards/` (`AgentReward`, `SIDomainReward`) |
+| LLaMA-Factory integration | `app/finetuning/llamafactory/` |
 
-**실행**
+**Run**
 
 ```bash
-# Llama LoRA 파인튜닝
+# Llama LoRA fine-tuning
 python runs/run_finetuning.py --model-path /ai_models --data-path /data/output/1105 --epochs 3
-
-# 다중 GPU (DDP)
+# Multi-GPU (DDP)
 torchrun --nproc_per_node=2 runs/run_finetuning.py --model-path /ai_models --data-path /data/output/1105
-
-# Qwen3 멀티페이즈
+# Qwen3 multi-phase
 python runs/run_qwen3_finetuning.py
 ```
 
-상세: [`llama/process.md`](./llama/process.md) · [`qwen3_finetuning_process.md`](./qwen3_finetuning_process.md)
+Details: [`llama/process.md`](./llama/process.md) · [`qwen3_finetuning_process.md`](./qwen3_finetuning_process.md)
 
 ---
 
-## 4. 데이터 구성 (Dataset Configuration)
+## 4. Dataset Configuration
 
-PDF 원문 → instruction-response JSON 생성 (4-Stage).
+PDF source documents → instruction-response JSON generation (4-Stage).
 
 ```
 PDFLoader(PyMuPDF4LLM) → MarkdownConverter → InstructionParser(GPT-4) → BatchedJSONWriter
 ```
 
-**출력 스키마** (학습 입력과 동일)
+**Output schema** (identical to training input)
 
 ```json
-[{ "instruction": "...", "context": "(선택)", "response": "..." }]
+[{ "instruction": "...", "context": "(optional)", "response": "..." }]
 ```
 
-**학습 방식별 데이터 구성**
+**Data composition by training method**
 
-| 방식 | 포맷 | 필드 |
+| Method | Format | Fields |
 |------|------|------|
-| SFT | ShareGPT `messages` | system/user/assistant 정답 1개 |
+| SFT | ShareGPT `messages` | system/user/assistant — one gold answer |
 | DPO | `sharegpt_dpo` (ranking) | `conversations` + `chosen` + `rejected` |
-| GRPO | 프롬프트 + 보상함수 | 정답·쌍 불필요, `RewardFunction.compute()` 점수화 |
+| GRPO | Prompt + reward function | No gold answers or pairs needed; scored via `RewardFunction.compute()` |
 
-**코드 경로**
+**Code paths**
 
-| 구분 | 경로 |
+| Category | Path |
 |------|------|
-| 전처리 패키지 | `app/data_handling/data_pre_processing/` |
-| Qwen3 데이터 파이프라인 | `app/data_handling/` (chunker, qa_generation, quality, ragas_eval, trajectory) |
-| 진입점 | `runs/run_cpx_processing.py`, `runs/run_qwen3_data_pipeline.py` |
+| Preprocessing package | `app/data_handling/data_pre_processing/` |
+| Qwen3 data pipeline | `app/data_handling/` (chunker, qa_generation, quality, ragas_eval, trajectory) |
+| Entry points | `runs/run_cpx_processing.py`, `runs/run_qwen3_data_pipeline.py` |
 
 ```bash
 INPUT_PATH=/data/input/cpx.pdf OUTPUT_PATH=/data/output/1105 python runs/run_cpx_processing.py
 ```
 
-상세: [`llama/data_preprocessing.md`](./llama/data_preprocessing.md)
+Details: [`llama/data_preprocessing.md`](./llama/data_preprocessing.md)
 
 ---
 
-## 5. 추론 & 서빙 구성 (Inference & Serving)
+## 5. Inference & Serving
 
-| 구분 | 경로 | 설명 |
+| Category | Path | Description |
 |------|------|------|
-| 경량 추론 서버 | `server.py` | 단일 모델 기동, `/generate`·`/stream`·`/health` |
-| 풀 파이프라인 API | `main.py` | 모델 로드/학습/추론 통합, OpenAI 호환 chat |
-| vLLM 서빙 | `app/serving/vllm_config.py` | Qwen3 Agent용, Hermes tool parser |
-| 모델 로드 헬퍼 | `runs/load_llama_3_1_8b.py` | Llama 3.1 8B 로드 검증 |
+| Lightweight inference server | `server.py` | Single-model startup; `/generate`, `/stream`, `/health` |
+| Full pipeline API | `main.py` | Integrated model load/training/inference; OpenAI-compatible chat |
+| vLLM serving | `app/serving/vllm_config.py` | For Qwen3 Agent; Hermes tool parser |
+| Model load helper | `runs/load_llama_3_1_8b.py` | Llama 3.1 8B load verification |
 
 ```bash
-# 경량 추론 서버
+# Lightweight inference server
 MODEL_DIR=/path/to/model USE_4BIT=1 uvicorn server:app --host 0.0.0.0 --port 8080
-
-# vLLM (툴콜 지원)
+# vLLM (with tool calling)
 ./scripts/serve_qwen3_vllm.sh
 ```
 
-**OpenAI 호환 REST API** — 두 진입점
+**OpenAI-compatible REST API** — two entry points
 
 `main.py` — Full Pipeline API (`:8000`)
 
-| 분류 | 엔드포인트 |
+| Category | Endpoints |
 |------|-----------|
 | Health | `GET /health` |
 | Model | `POST /api/v1/models/load`, `GET /api/v1/models/{id}/verify` |
@@ -173,73 +165,73 @@ MODEL_DIR=/path/to/model USE_4BIT=1 uvicorn server:app --host 0.0.0.0 --port 808
 | Multi-Phase | `POST /api/v1/training/multi-phase/start` |
 | Data Pipeline | `POST /api/v1/data-pipeline/generate-qa` |
 | Inference | `POST /api/v1/inference/load`, `GET /api/v1/inference/models` |
-| Chat (OpenAI 호환) | `POST /api/v1/chat/completions`, `POST /v1/chat/completions` |
+| Chat (OpenAI-compatible) | `POST /api/v1/chat/completions`, `POST /v1/chat/completions` |
 
-`server.py` — Inference API (`:8080`): `POST /generate`, `POST /stream`(SSE), `GET /health`
+`server.py` — Inference API (`:8080`): `POST /generate`, `POST /stream` (SSE), `GET /health`
 
 ```bash
-./scripts/api_server.sh start    # main.py 기동
+./scripts/api_server.sh start    # start main.py
 ```
 
-호출 예시: [`API_SAMPLE.md`](./API_SAMPLE.md)
+Request examples: [`API_SAMPLE.md`](./API_SAMPLE.md)
 
 ---
 
-## 6. 평가 구성 (Evaluation)
+## 6. Evaluation
 
-| 구분 | 경로 |
+| Category | Path |
 |------|------|
-| Agent 평가 | `runs/eval_agent.py` |
-| 도메인 평가 | `runs/eval_domain.py` |
-| 모델 평가 | `runs/eval_model.py` |
-| 자연어 표면지표(BLEU/ROUGE/METEOR/BERTScore) | `runs/eval_nlg.py` |
-| RAGAS 평가 | `runs/eval_ragas.py` |
-| 모델 비교 | `runs/eval_compare.py` |
+| Agent evaluation | `runs/eval_agent.py` |
+| Domain evaluation | `runs/eval_domain.py` |
+| Model evaluation | `runs/eval_model.py` |
+| NLG surface metrics (BLEU/ROUGE/METEOR/BERTScore) | `runs/eval_nlg.py` |
+| RAGAS evaluation | `runs/eval_ragas.py` |
+| Model comparison | `runs/eval_compare.py` |
 
-상세: [`evaluation.md`](./evaluation.md) · [`llama/evaluation_usage.md`](./llama/evaluation_usage.md) · [`llama/evaluation_runbook.md`](./llama/evaluation_runbook.md)
+Details: [`evaluation.md`](./evaluation.md) · [`llama/evaluation_usage.md`](./llama/evaluation_usage.md) · [`llama/evaluation_runbook.md`](./llama/evaluation_runbook.md)
 
 ---
 
-## 7. 데모 (Demo)
+## 7. Demo
 
-| 구분 | 경로 | 설명 |
+| Category | Path | Description |
 |------|------|------|
-| 의료 챗 루프 데모 | `scripts/medical_chat_loop.sh` | 랜덤 의료 질문 N개를 chat API로 병렬 호출(주기 반복) |
-| 질문 셋 | `scripts/medical_questions.txt` | 데모 입력 질문 풀 |
-| 시스템 프롬프트 | `scripts/medical_system_prompt.txt` | 데모용 system 프롬프트 |
-| 프론트엔드 연동 가이드 | [`frontend_request_cancel_guide.md`](./frontend_request_cancel_guide.md) | 요청/취소 연동 |
+| Medical chat loop demo | `scripts/medical_chat_loop.sh` | Calls the chat API in parallel with N random medical questions (repeats periodically) |
+| Question set | `scripts/medical_questions.txt` | Question pool for demo input |
+| System prompt | `scripts/medical_system_prompt.txt` | System prompt for the demo |
+| Frontend integration guide | [`frontend_request_cancel_guide.md`](./frontend_request_cancel_guide.md) | Request/cancel integration |
 
 ```bash
-# 추론 서버 기동 후
+# After starting the inference server
 API_URL=http://localhost:8000 MODEL=MediCPX ./scripts/medical_chat_loop.sh
 ```
 
 ---
 
-## 부록 — 산출물 인벤토리 (Deliverables)
+## Appendix — Deliverables Inventory
 
-| # | 항목 | 핵심 위치 | 형태 |
+| # | Item | Key Location | Form |
 |---|------|-----------|------|
-| 1 | 모델 가중치 | `final_model/`, HF Hub `the-platforms/MediCPX` | LoRA 어댑터 / 병합 모델 |
-| 2 | 학습 코드 | `app/finetuning/`, `runs/run_finetuning.py` | Python 패키지 + 진입점 |
-| 3 | 추론 코드 | `server.py`, `main.py`, `app/serving/` | FastAPI + vLLM |
-| 4 | 데이터셋 | `app/data_handling/`, `runs/run_cpx_processing.py` | PDF→instruction JSON |
-| 5 | 데모 | `scripts/medical_chat_loop.sh` | CLI 챗 데모 |
-| 6 | API | `main.py` (Full) / `server.py` (Inference) | OpenAI 호환 REST |
-| 7 | 기술문서 | `docs/` | Markdown + 논문/특허 |
+| 1 | Model weights | `final_model/`, HF Hub `the-platforms/MediCPX` | LoRA adapter / merged model |
+| 2 | Training code | `app/finetuning/`, `runs/run_finetuning.py` | Python package + entry point |
+| 3 | Inference code | `server.py`, `main.py`, `app/serving/` | FastAPI + vLLM |
+| 4 | Dataset | `app/data_handling/`, `runs/run_cpx_processing.py` | PDF → instruction JSON |
+| 5 | Demo | `scripts/medical_chat_loop.sh` | CLI chat demo |
+| 6 | API | `main.py` (Full) / `server.py` (Inference) | OpenAI-compatible REST |
+| 7 | Technical docs | `docs/` | Markdown + papers/patents |
 
-**기술문서 목록**
+**Technical documentation**
 
-| 분류 | 문서 |
+| Category | Document |
 |------|------|
-| 프로젝트 개요 | [`README.md`](./README.md), [`QUICKSTART.md`](./QUICKSTART.md) |
-| End-to-End 요약 | [`llama/end_to_end_summary.md`](./llama/end_to_end_summary.md) |
-| 데이터 전처리 | [`llama/data_preprocessing.md`](./llama/data_preprocessing.md) |
-| 학습 walkthrough | [`llama/process.md`](./llama/process.md) |
-| Qwen3 멀티페이즈 | [`qwen3_finetuning_process.md`](./qwen3_finetuning_process.md) |
-| 평가 | [`evaluation.md`](./evaluation.md), [`llama/evaluation_usage.md`](./llama/evaluation_usage.md), [`llama/evaluation_runbook.md`](./llama/evaluation_runbook.md) |
-| 개선 적용 이력 | [`llama/improvements.md`](./llama/improvements.md) |
-| 연구·논문 | [`llama/research.md`](./llama/research.md), [`llama/papers.md`](./llama/papers.md) |
-| HF 업로드 | [`llama/huggingface_upload.md`](./llama/huggingface_upload.md) |
-| 배포 | [`deployments/README.md`](./deployments/README.md) (Docker, K3s) |
-| 특허/논문 초안 | `docs/paper/` (CPX 의료 도메인 IMRaD, 특허출원 초안·도면) |
+| Project overview | [`README.md`](./README.md), [`QUICKSTART.md`](./QUICKSTART.md) |
+| End-to-end summary | [`llama/end_to_end_summary.md`](./llama/end_to_end_summary.md) |
+| Data preprocessing | [`llama/data_preprocessing.md`](./llama/data_preprocessing.md) |
+| Training walkthrough | [`llama/process.md`](./llama/process.md) |
+| Qwen3 multi-phase | [`qwen3_finetuning_process.md`](./qwen3_finetuning_process.md) |
+| Evaluation | [`evaluation.md`](./evaluation.md), [`llama/evaluation_usage.md`](./llama/evaluation_usage.md), [`llama/evaluation_runbook.md`](./llama/evaluation_runbook.md) |
+| Improvement history | [`llama/improvements.md`](./llama/improvements.md) |
+| Research & papers | [`llama/research.md`](./llama/research.md), [`llama/papers.md`](./llama/papers.md) |
+| HF upload | [`llama/huggingface_upload.md`](./llama/huggingface_upload.md) |
+| Deployment | [`deployments/README.md`](./deployments/README.md) (Docker, K3s) |
+| Patent/paper drafts | `docs/paper/` (CPX medical-domain IMRaD, patent application drafts & figures) |
